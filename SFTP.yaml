@@ -1,0 +1,568 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SFTPv2.2 Server
+
+Parameters:
+  AMI:
+    Description: AMI ID of the SFTP build instance
+    Type: AWS::EC2::Image::Id
+    Default: ami-05ef2ae39497f0b57
+  VPCID:
+    Description: VPC ID to launch instances
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-04cffa61
+  SubnetID:
+    Description: Subnet IDs to launch instances. Specify one public subnet per Availability
+      Zone
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-6831371f,subnet-552e700c,subnet-7ad4f21e
+  KeyPair:
+    Description: Key pair to launch the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: sftp-uk02
+  SSHLocation:
+    Description: The IP address range that can be used to SSH/SFTP to the EC2 instances
+      in addition to the default administrative ranges
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+  SFTPUser:
+    Description: The username of the SFTP user to create on the service
+    Type: String
+    MinLength: '3'
+    MaxLength: '15'
+    AllowedPattern: "[a-z0-9_\\-]*"
+    ConstraintDescription: Must be a lower case username from 3 to 15 characters long
+  SFTPPublicKey:
+    Description: The OpenSSH RSA Public Key for the user
+    Type: String
+    ConstraintDescription: Must be a valid OpenSSH RSA Public Key
+  CIFSShare:
+    Description: The CIFS path (in linux format) of the share
+    Type: String
+    AllowedPattern: "(\\/\\/)([a-zA-Z0-9\\-_.]*)(\\/)([a-zA-Z0-9\\-_.$]*)(\\/)"
+    ConstraintDescription: Share path must be in Linux format eg. //server/share$/
+  CIFSToCloudPath:
+    Description: The path (in linux format) to the 'sftp-in' folder relative to the
+      share
+    Type: String
+    AllowedPattern: "(([a-zA-Z0-9\\-_.]*)(\\/))+"
+    ConstraintDescription: Folder path must be in Linux format eg. folder/subfolder/
+  CIFSFromCloudPath:
+    Description: The path (in linux format) to the 'sftp-out' folder relative to the
+      share
+    Type: String
+    AllowedPattern: "(([a-zA-Z0-9\\-_.]*)(\\/))+"
+    ConstraintDescription: Folder path must be in Linux format eg. folder/subfolder/
+  CIFSUser:
+    Description: The username to use to mount the CIFS share
+    MinLength: '3'
+    MaxLength: '25'
+    Type: String
+  CIFSPassword:
+    Description: The password to use to mount the CIFS share
+    MinLength: '8'
+    MaxLength: '25'
+    Type: String
+    NoEcho: 'true'
+
+Resources:
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Ref: AWS::StackName
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      RetentionInDays: 3653
+  LogFilterSMBFailure:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: "[Status, Check]"
+      MetricTransformations:
+      - MetricName:
+          Fn::Sub:
+          - "${stackname} - SFTPCifsUnmounted"
+          - stackname:
+              Ref: AWS::StackName
+        MetricNamespace: SMBMetrics
+        MetricValue: "$Check"
+  SMBMountFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      AlarmDescription: The Mount point has failed
+      MetricName:
+        Fn::Sub:
+        - "${stackname} - SFTPCifsUnmounted"
+        - stackname:
+            Ref: AWS::StackName
+      Namespace: SMBMetrics
+      Statistic: Maximum
+      Period: '60'
+      EvaluationPeriods: '5'
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      AlarmActions:
+      - arn:aws:sns:eu-west-1:220441489773:CloudWatch-to-PagerDuty
+      OKActions:
+      - arn:aws:sns:eu-west-1:220441489773:CloudWatch-to-PagerDuty
+  LogFilterSFTPSessionEnd:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", session="session",
+        closed="closed", for="for", local="local", user="user", username, from="from",
+        ip]'
+      MetricTransformations:
+      - MetricName: SFTPSessionEnd
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterSFTPUpload:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", close="close", path,
+        bytes="bytes", read="read", bytesread=0, written="written", byteswritten>0,
+        ...]'
+      MetricTransformations:
+      - MetricName: SFTPUpload
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterSFTPUploadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterSFTPUpload
+    Properties:
+      AlarmDescription: High rate of SFTP uploads
+      MetricName: SFTPUpload
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '3600'
+      EvaluationPeriods: '1'
+      Threshold: '60'
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterSFTPUploadBytes:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", close="close", path,
+        bytes="bytes", read="read", bytesread=0, written="written", byteswritten>0,
+        ...]'
+      MetricTransformations:
+      - MetricName: SFTPUpload
+        MetricNamespace: SFTP
+        MetricValue: "$byteswritten"
+  LogFilterSFTPUploadBytesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterSFTPUploadBytes
+    Properties:
+      AlarmDescription: High rate of SFTP uploads
+      MetricName: SFTPUpload
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '3600'
+      EvaluationPeriods: '1'
+      Threshold: '104857600'
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterSFTPDownload:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", close="close", path,
+        bytes="bytes", read="read", bytesread>0, written="written", byteswritten=0,
+        ...]'
+      MetricTransformations:
+      - MetricName: SFTPDownload
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterSFTPDownloadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterSFTPDownload
+    Properties:
+      AlarmDescription: High rate of SFTP downloads
+      MetricName: SFTPDownload
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '3600'
+      EvaluationPeriods: '1'
+      Threshold: '60'
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterSFTPDownloadBytes:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", close="close", path,
+        bytes="bytes", read="read", bytesread>0, written="written", byteswritten=0,
+        ...]'
+      MetricTransformations:
+      - MetricName: SFTPDownloadBytes
+        MetricNamespace: SFTP
+        MetricValue: "$bytesread"
+  LogFilterSFTPDownloadBytesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterSFTPDownloadBytes
+    Properties:
+      AlarmDescription: High volume of SFTP downloads
+      MetricName: SFTPDownloadBytes
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '3600'
+      EvaluationPeriods: '1'
+      Threshold: '104857600'
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterClamDStopped:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="clamd*", dashes="---", stopped="Stopped",
+        ...]'
+      MetricTransformations:
+      - MetricName: ClamDStopped
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterClamDStoppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterClamDStopped
+    Properties:
+      AlarmDescription: Clam daemon stopped events
+      MetricName: ClamDStopped
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterClamUpdate:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="freshclam*", clamav="ClamAV",
+        update="update", process="process", started="started",...]'
+      MetricTransformations:
+      - MetricName: ClamUpdate
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterClamUpdateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterClamUpdate
+    Properties:
+      AlarmDescription: No clamAV definitions updates
+      MetricName: ClamUpdate
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '86400'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterVirusDetection:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="clamd*", ScanOnAccess="ScanOnAccess:",
+        path, ..., signature, FOUND="FOUND"]'
+      MetricTransformations:
+      - MetricName: VirusDetection
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterVirusDetectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+    - LogFilterVirusDetection
+    Properties:
+      AlarmDescription: ClamD detection events
+      MetricName: VirusDetection
+      Namespace: SFTP
+      Statistic: Sum
+      Period: '60'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+  LogFilterInvalidUser:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", invalid="Invalid",
+        user="user", username, from="from", ip]'
+      MetricTransformations:
+      - MetricName: InvalidUser
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  LogFilterRootLoginRefused:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+    - CloudWatchLogsGroup
+    Properties:
+      LogGroupName:
+        Ref: AWS::StackName
+      FilterPattern: '[month, day, time, host, service="sshd*", ROOT="ROOT", LOGIN="LOGIN",
+        REFUSED="REFUSED", FROM="FROM", ip]'
+      MetricTransformations:
+      - MetricName: RootLoginRefused
+        MetricNamespace: SFTP
+        MetricValue: '1'
+  SFTPHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: LogRolePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: Stmt1488263956000
+            Effect: Allow
+            Action:
+            - ec2:AssociateAddress
+            - ec2:DescribeAddresses
+            Resource:
+            - "*"
+          - Effect: Allow
+            Action:
+            - ssm:DescribeAssociation
+            - ssm:GetDeployablePatchSnapshotForInstance
+            - ssm:GetDocument
+            - ssm:GetParameters
+            - ssm:ListAssociations
+            - ssm:ListInstanceAssociations
+            - ssm:PutInventory
+            - ssm:UpdateAssociationStatus
+            - ssm:UpdateInstanceAssociationStatus
+            - ssm:UpdateInstanceInformation
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2messages:AcknowledgeMessage
+            - ec2messages:DeleteMessage
+            - ec2messages:FailMessage
+            - ec2messages:GetEndpoint
+            - ec2messages:GetMessages
+            - ec2messages:SendReply
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2:DescribeInstanceStatus
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ds:CreateComputer
+            - ds:DescribeDirectories
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:AbortMultipartUpload
+            - s3:ListMultipartUploadParts
+            - s3:ListBucketMultipartUploads
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            Resource: arn:aws:s3:::amazon-ssm-packages-*
+  SFTPHostRoleInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: SFTPHostRole
+  SFTPHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 and SSH access via port 22
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp:
+          Ref: SSHLocation
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 54.66.221.126/32
+        Description: XYMON
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 202.12.109.0/24
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: '445'
+        ToPort: '445'
+        CidrIp: 10.0.0.0/8
+      - IpProtocol: udp
+        FromPort: '53'
+        ToPort: '53'
+        CidrIp: 10.0.0.0/8
+      - IpProtocol: tcp
+        FromPort: '445'
+        ToPort: '445'
+        CidrIp: 192.168.0.0/16
+      - IpProtocol: udp
+        FromPort: '53'
+        ToPort: '53'
+        CidrIp: 192.168.0.0/16
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        FromPort: '123'
+        ToPort: '123'
+        CidrIp: 0.0.0.0/0
+        Description: ntp
+      VpcId:
+        Ref: VPCID
+  GroupEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  AutoScalingLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+    - GroupEIP
+    - SFTPHostSecurityGroup
+    - SFTPHostRoleInstanceProfile
+    Properties:
+      AssociatePublicIpAddress: 'true'
+      IamInstanceProfile:
+        Ref: SFTPHostRoleInstanceProfile
+      ImageId:
+        Ref: AMI
+      InstanceType: t2.small
+      KeyName:
+        Ref: KeyPair
+      SecurityGroups:
+      - Ref: SFTPHostSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+          - ''
+          - - LogGroupName='
+            - Ref: CloudWatchLogsGroup
+            - "'\n"
+            - EIP='
+            - Ref: GroupEIP
+            - "'\n"
+            - SFTPUser='
+            - Ref: SFTPUser
+            - "'\n"
+            - SFTPPublicKey='
+            - Ref: SFTPPublicKey
+            - "'\n"
+            - CIFSShare='
+            - Ref: CIFSShare
+            - "'\n"
+            - CIFSToCloudPath='
+            - Ref: CIFSToCloudPath
+            - "'\n"
+            - CIFSFromCloudPath='
+            - Ref: CIFSFromCloudPath
+            - "'\n"
+            - CIFSUser='
+            - Ref: CIFSUser
+            - "'\n"
+            - CIFSPassword='
+            - Ref: CIFSPassword
+            - "'\n"
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      Cooldown: '600'
+      DesiredCapacity: '1'
+      HealthCheckGracePeriod: '600'
+      HealthCheckType: EC2
+      LaunchConfigurationName:
+        Ref: AutoScalingLaunchConfig
+      MaxSize: '1'
+      MinSize: '1'
+      VPCZoneIdentifier:
+        Ref: SubnetID
+Outputs:
+  ServiceEIP:
+    Description: The elastic IP address used by the service
+    Value:
+      Ref: GroupEIP
